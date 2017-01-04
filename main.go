@@ -2,21 +2,26 @@ package main
 
 import (
 	"database/sql"
-	"strconv"
-	//"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
-
+	"github.com/go-kit/kit/log"
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/sjwhitworth/golearn/base"
 	"github.com/sjwhitworth/golearn/evaluation"
-	//"github.com/sjwhitworth/golearn/evaluation"
-	"io/ioutil"
-	"os"
-	"time"
-
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/sjwhitworth/golearn/knn"
+	"io/ioutil"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
 )
+
+type PredictionResponse struct {
+	Result     string
+	Prediction string
+	CM         string
+}
 
 type Status struct {
 	Name        string
@@ -27,56 +32,94 @@ type Status struct {
 	Docks       int
 }
 
+// DB Connection
 var db *sql.DB
-var err error
-var time_layout = "2006-01-02T15:04:05Z"
+
+// Logger for logging
+var logger log.Logger
 
 func main() {
-	//cls := knn.NewKnnClassifier("euclidean", 2)
-	json_file := os.Args[1]
-	if json_file == "" {
-		fmt.Printf("No filename passed: %v\n")
-		os.Exit(1)
-	}
-	db, err = sql.Open("mysql", "root:H3nry2mysql@/bike_predictor")
+
+	// Initialise logging
+	logger = log.NewLogfmtLogger(os.Stderr)
+	logger = log.NewContext(logger).With("ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller)
+	logger.Log("msg", "Starting bikepredictor")
+
+	// Open a connection to the database
+	var err error
+	db, err = sql.Open("mysql", os.Getenv("BP_DATABASE_URL"))
 	if err != nil {
-		fmt.Printf("MySQL error: %v\n", err)
+		logger.Log("msg", "Failed to open database")
 		os.Exit(1)
 	}
 	defer db.Close()
-	//import_file(json_file)
-	targetTime, _ := time.Parse("2006-01-02 15:04", "2017-01-05 09:00")
-	predict("London", "102", targetTime)
+
+	// Setup the http handlers
+	http.HandleFunc("/import_file", import_file_handler)
+	http.HandleFunc("/predict", predict_handler)
+	bind := fmt.Sprintf("%s:%s", os.Getenv("BP_IP"), os.Getenv("BP_PORT"))
+	err = http.ListenAndServe(bind, nil)
+	if err != nil {
+		logger.Log("msg", "Failed to listen", "error", err)
+		panic(err)
+	}
 }
 
-func import_file(filename string) {
+// Handler for import file requests. Decoupled from the function so that
+// the function can be called via other means
+func import_file_handler(w http.ResponseWriter, r *http.Request) {
+	filename := r.URL.Query().Get("filename")
+	status, err := import_file(filename)
+
+	if err != nil {
+		http.Error(w, "There was an error", 500)
+		return
+	}
+
+	w.Header().Set("Server", "bikepredictor")
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(status))
+}
+
+// Imports a file from the filesystem into the database
+func import_file(filename string) (string, error) {
+
+	logger.Log("msg", "Importing file", "filename", filename)
+
+	var time_layout = "2006-01-02T15:04:05Z"
 
 	file, err := ioutil.ReadFile(filename)
 	if err != nil {
-		fmt.Printf("File error: %v\n", err)
-		os.Exit(1)
+		logger.Log("err", err)
+		return "", err
 	}
 
 	var statuses []Status
 	json.Unmarshal(file, &statuses)
 
+	if len(statuses) < 1 {
+		err = errors.New("json contained no statuses")
+		logger.Log("err", err)
+		return "", err
+	}
+
 	tx, err := db.Begin()
 	if err != nil {
-		fmt.Printf("MySQL error: %v\n", err)
-		os.Exit(1)
+		logger.Log("msg", "failed to create db transaction", "error", err)
+		return "", err
 	}
 
-	stmtIns, err := tx.Prepare("INSERT INTO statuses(SchemeId, DockId, Name, Bikes, Docks, cDay, cMonth, cMinuteOfDay) VALUES(?,?,?,?,?,?,?,?)")
+	stmtIns, err := tx.Prepare("INSERT INTO statuses(SchemeId, DockId, Name, Bikes, Docks, cMonth, cDay, cMinuteOfDay) VALUES(?,?,?,?,?,?,?,?)")
 	if err != nil {
-		fmt.Printf("MySQL error: %v\n", err)
-		os.Exit(1)
+		tx.Rollback()
+		logger.Log("err", err)
+		return "", err
 	}
 	defer stmtIns.Close()
-
 	for _, status := range statuses {
 		t, err := time.Parse(time_layout, status.RequestTime)
 		if err != nil {
-			fmt.Printf("Date error: %v\n", err)
+			logger.Log("err", err)
 		}
 
 		minute_of_day := t.Hour()*60 + t.Minute()
@@ -86,29 +129,57 @@ func import_file(filename string) {
 			status.Name,
 			status.Bikes,
 			status.Docks,
-			t.Weekday(),
 			t.Month(),
+			t.Weekday(),
 			minute_of_day,
 		)
 		if err != nil {
-			fmt.Printf("Error inserting row: %v\n", err)
+			logger.Log("err", err)
 		}
 
 	}
 
 	err = tx.Commit()
 	if err != nil {
-		fmt.Printf("MySQL error: %v\n", err)
+		logger.Log("err", err)
 	}
 
+	return "OK", nil
 }
 
-func predict(scheme string, dockid string, targetTime time.Time) {
+// HTTP handler for predict function
+func predict_handler(w http.ResponseWriter, r *http.Request) {
+	scheme := r.URL.Query().Get("scheme")
+	dockid := r.URL.Query().Get("dockid")
+	targetTime, _ := time.Parse("200601021504", r.URL.Query().Get("targettime"))
+	response, err := predict(scheme, dockid, targetTime)
+
+	if err != nil {
+		http.Error(w, "There was an error", 500)
+		return
+	}
+
+	ret, err := json.Marshal(response)
+	if err != nil {
+		http.Error(w, "There was an error converting response to json", 500)
+		return
+	}
+	w.Header().Set("Server", "bikepredictor")
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(ret))
+}
+
+// Function to predict
+func predict(scheme string, dockid string, targetTime time.Time) (PredictionResponse, error) {
+
+	logger.Log("msg", "predicting", "scheme", scheme, "dockid", dockid, "time", targetTime)
+
+	var ret PredictionResponse
 
 	// Let's create some attributes
 	attrs := make([]base.Attribute, 4)
-	attrs[0] = base.NewFloatAttribute("dayofweek")
-	attrs[1] = base.NewFloatAttribute("month")
+	attrs[0] = base.NewFloatAttribute("month")
+	attrs[1] = base.NewFloatAttribute("dayofweek")
 	attrs[2] = base.NewFloatAttribute("minuteofday")
 	attrs[3] = new(base.CategoricalAttribute)
 	attrs[3].SetName("label")
@@ -128,16 +199,16 @@ func predict(scheme string, dockid string, targetTime time.Time) {
 	rowCount := db.QueryRow("Select count(*) c from bike_predictor.statuses where SchemeID = ? and DockId = ?", scheme, dockid)
 	var count int
 	if err := rowCount.Scan(&count); err != nil {
-		fmt.Printf("Failed to scan for row count %v", err)
-		os.Exit(1)
+		logger.Log("err", err)
+		return ret, err
 	}
 	// Allocate space
 	trainData.Extend(count)
 
-	rows, err := db.Query("Select Bikes, Docks, cDay, cMinuteOfDay, cMonth from bike_predictor.statuses where SchemeID = ? and DockId = ?", "London", "102")
+	rows, err := db.Query("Select Bikes, Docks, cMonth, cDay, cMinuteOfDay from bike_predictor.statuses where SchemeID = ? and DockId = ?", scheme, dockid)
 	if err != nil {
-		fmt.Printf("%v", err)
-		os.Exit(1)
+		logger.Log("err", err)
+		return ret, err
 	}
 	defer rows.Close()
 	var bikes int
@@ -147,126 +218,86 @@ func predict(scheme string, dockid string, targetTime time.Time) {
 	var cMinuteOfDay string
 	var status string
 	var i int
-	/*
-		record := []string{"dayofweek", "month", "minuteofday", "label"}
-		w.Write(record)
-	*/
 	i = 0
 
 	for rows.Next() {
 
-		if err := rows.Scan(&bikes, &docks, &cDay, &cMonth, &cMinuteOfDay); err != nil {
-			fmt.Printf("%v", err)
-			os.Exit(1)
+		if err := rows.Scan(&bikes, &docks, &cMonth, &cDay, &cMinuteOfDay); err != nil {
+			logger.Log("err", err)
+			return ret, err
 		}
 
-		if bikes > 3 {
-			status = "bikes"
-		}
-		if docks > 3 {
+		status = "both"
+		if bikes < 5 {
 			status = "docks"
 		}
-		if bikes > 3 && docks > 3 {
-			status = "both"
+		if docks < 5 {
+			status = "bikes"
 		}
-		if bikes < 3 && docks < 3 {
+		if bikes < 5 && docks < 5 {
 			status = "none"
 		}
 
-		/*
-			record := []string{cDay, cMonth, cMinuteOfDay, status}
-
-			w.Write(record)
-		*/
-
-		// Write the data
-		trainData.Set(trainSpecs[0], i, trainSpecs[0].GetAttribute().GetSysValFromString(cDay))
-		trainData.Set(trainSpecs[1], i, trainSpecs[1].GetAttribute().GetSysValFromString(cMonth))
+		// Save the data in the trainData array
+		trainData.Set(trainSpecs[0], i, trainSpecs[0].GetAttribute().GetSysValFromString(cMonth))
+		trainData.Set(trainSpecs[1], i, trainSpecs[1].GetAttribute().GetSysValFromString(cDay))
 		trainData.Set(trainSpecs[2], i, trainSpecs[2].GetAttribute().GetSysValFromString(cMinuteOfDay))
 		trainData.Set(trainSpecs[3], i, trainSpecs[3].GetAttribute().GetSysValFromString(status))
 		i++
 
 	}
-	//w.Flush()
 	if err := rows.Err(); err != nil {
-		fmt.Printf("%v", err)
-		os.Exit(1)
+		logger.Log("err", err)
+		return ret, err
 	}
 
 	fmt.Println("%v", trainData)
 
-	// Load in a dataset, with headers. Header attributes will be stored.
-	// Think of instances as a Data Frame structure in R or Pandas.
-	// You can also create instances from scratch.
-	/**
-	rawData, err := base.ParseCSVToInstances("./_predict.csv", true)
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println("%v", rawData)
-	*/
-
-	// Let's create some attributes
-	/*
-		trainData.AddClassAttribute(attrs[3]);
-			attrs := make([]base.Attribute, 4)
-			attrs[0] = base.NewFloatAttribute("dayofweek")
-			attrs[1] = base.NewFloatAttribute("month")
-			attrs[2] = base.NewFloatAttribute("minuteofday")
-			attrs[3] = new(base.CategoricalAttribute)
-			attrs[3].SetName("label")
-	*/
-
 	// Now let's create the final instances set
-	newInst := base.NewDenseInstances()
-	newInst.AddClassAttribute(attrs[3])
+	targetInst := base.NewDenseInstances()
+	targetInst.AddClassAttribute(attrs[3])
 
 	// Add the attributes
-	newSpecs := make([]base.AttributeSpec, len(attrs))
+	targetSpecs := make([]base.AttributeSpec, len(attrs))
 	for i, a := range attrs {
-		newSpecs[i] = newInst.AddAttribute(a)
+		targetSpecs[i] = targetInst.AddAttribute(a)
 	}
 	// By convention
-	newInst.AddClassAttribute(attrs[len(attrs)-1])
+	targetInst.AddClassAttribute(attrs[len(attrs)-1])
 
 	// Allocate space
-	newInst.Extend(1)
+	targetInst.Extend(1)
 
 	// Write the data
-	newInst.Set(newSpecs[0], 0, newSpecs[0].GetAttribute().GetSysValFromString(strconv.Itoa(int(targetTime.Weekday()))))
-	newInst.Set(newSpecs[1], 0, newSpecs[1].GetAttribute().GetSysValFromString(strconv.Itoa(int(targetTime.Month()))))
-	newInst.Set(newSpecs[2], 0, newSpecs[2].GetAttribute().GetSysValFromString(strconv.Itoa(targetTime.Minute()+(targetTime.Hour()*60))))
-	newInst.Set(newSpecs[3], 0, newSpecs[3].GetAttribute().GetSysValFromString(""))
-
-	fmt.Println(newInst)
-
-	// Print a pleasant summary of your data.
-	//fmt.Println(rawData)
+	targetInst.Set(targetSpecs[0], 0, targetSpecs[0].GetAttribute().GetSysValFromString(strconv.Itoa(int(targetTime.Month()))))
+	targetInst.Set(targetSpecs[1], 0, targetSpecs[1].GetAttribute().GetSysValFromString(strconv.Itoa(int(targetTime.Weekday()))))
+	targetInst.Set(targetSpecs[2], 0, targetSpecs[2].GetAttribute().GetSysValFromString(strconv.Itoa(targetTime.Minute()+(targetTime.Hour()*60))))
+	targetInst.Set(targetSpecs[3], 0, targetSpecs[3].GetAttribute().GetSysValFromString(""))
 
 	//Initialises a new KNN classifier
 	cls := knn.NewKnnClassifier("euclidean", 2)
 
-	//Do a training-test split
-	//trainData, testData := base.InstancesTrainTestSplit(rawData, 0.50)
-	//fmt.Println(trainData)
+	//Fit the training data
 	cls.Fit(trainData)
 
-	//Calculates the Euclidean distance and returns the most popular label
-	predictions, err := cls.Predict(newInst)
+	//Calculate the Euclidean distance and predict the likely label
+	prediction, err := cls.Predict(targetInst)
 	if err != nil {
-		panic(err)
+		logger.Log("err", err)
+		return ret, err
 	}
-
-	fmt.Println("predictions - %v", predictions)
 
 	// Prints precision/recall metrics
-	confusionMat, err := evaluation.GetConfusionMatrix(newInst, predictions)
+	CM, _ := evaluation.GetConfusionMatrix(targetInst, prediction)
 	if err != nil {
-		panic(fmt.Sprintf("Unable to get confusion matrix: %s", err.Error()))
+		logger.Log("err", err)
+		return ret, err
 	}
-	fmt.Println(evaluation.GetSummary(confusionMat))
-	fmt.Printf("%v\n", targetTime)
-	fmt.Printf("weekday %v\n", strconv.Itoa(int(targetTime.Weekday())))
-	fmt.Printf("month %v\n", strconv.Itoa(int(targetTime.Month())))
 
+	// Store our results in the structure and return it
+	ret.Result = prediction.RowString(0)
+	ret.Prediction = fmt.Sprintf("%v", prediction)
+	ret.CM = fmt.Sprintf("%v", CM)
+
+	return ret, nil
 }
