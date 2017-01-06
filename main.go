@@ -169,48 +169,40 @@ func predict_handler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(ret))
 }
 
-// Function to predict
-func predict(scheme string, dockid string, targetTime time.Time) (PredictionResponse, error) {
-
-	logger.Log("msg", "predicting", "scheme", scheme, "dockid", dockid, "time", targetTime)
-
-	var ret PredictionResponse
-
-	// Let's create some attributes
+func createAttrs() []base.Attribute {
 	attrs := make([]base.Attribute, 4)
 	attrs[0] = base.NewFloatAttribute("month")
 	attrs[1] = base.NewFloatAttribute("dayofweek")
 	attrs[2] = base.NewFloatAttribute("minuteofday")
 	attrs[3] = new(base.CategoricalAttribute)
 	attrs[3].SetName("label")
+	return attrs
+}
 
+func createNewDenseInstances(size int) (*base.DenseInstances, []base.AttributeSpec) {
 	// Now let's create the final instances set
-	trainData := base.NewDenseInstances()
+	instances := base.NewDenseInstances()
 
-	// Add the attributes
-	trainSpecs := make([]base.AttributeSpec, len(attrs))
+	// Let's create some attributes
+	attrs := createAttrs()
+
+	// Add the attributes to the instance
+	instanceSpecs := make([]base.AttributeSpec, len(attrs))
 	for i, a := range attrs {
-		trainSpecs[i] = trainData.AddAttribute(a)
+		instanceSpecs[i] = instances.AddAttribute(a)
 	}
 
 	// By convention
-	trainData.AddClassAttribute(attrs[len(attrs)-1])
+	instances.AddClassAttribute(attrs[len(attrs)-1])
 
-	rowCount := db.QueryRow("Select count(*) c from bike_predictor.statuses where SchemeID = ? and DockId = ?", scheme, dockid)
-	var count int
-	if err := rowCount.Scan(&count); err != nil {
-		logger.Log("err", err)
-		return ret, err
-	}
-	// Allocate space
-	trainData.Extend(count)
+	// Extend it to the size we want
+	instances.Extend(size)
 
-	rows, err := db.Query("Select Bikes, Docks, cMonth, cDay, cMinuteOfDay from bike_predictor.statuses where SchemeID = ? and DockId = ?", scheme, dockid)
-	if err != nil {
-		logger.Log("err", err)
-		return ret, err
-	}
-	defer rows.Close()
+	return instances, instanceSpecs
+}
+
+func addDBRowsToInstance(rows *sql.Rows, instances *base.DenseInstances, specs []base.AttributeSpec) (err error) {
+
 	var bikes int
 	var docks int
 	var cDay string
@@ -224,7 +216,7 @@ func predict(scheme string, dockid string, targetTime time.Time) (PredictionResp
 
 		if err := rows.Scan(&bikes, &docks, &cMonth, &cDay, &cMinuteOfDay); err != nil {
 			logger.Log("err", err)
-			return ret, err
+			return err
 		}
 
 		status = "both"
@@ -239,31 +231,53 @@ func predict(scheme string, dockid string, targetTime time.Time) (PredictionResp
 		}
 
 		// Save the data in the trainData array
-		trainData.Set(trainSpecs[0], i, trainSpecs[0].GetAttribute().GetSysValFromString(cMonth))
-		trainData.Set(trainSpecs[1], i, trainSpecs[1].GetAttribute().GetSysValFromString(cDay))
-		trainData.Set(trainSpecs[2], i, trainSpecs[2].GetAttribute().GetSysValFromString(cMinuteOfDay))
-		trainData.Set(trainSpecs[3], i, trainSpecs[3].GetAttribute().GetSysValFromString(status))
+		instances.Set(specs[0], i, specs[0].GetAttribute().GetSysValFromString(cMonth))
+		instances.Set(specs[1], i, specs[1].GetAttribute().GetSysValFromString(cDay))
+		instances.Set(specs[2], i, specs[2].GetAttribute().GetSysValFromString(cMinuteOfDay))
+		instances.Set(specs[3], i, specs[3].GetAttribute().GetSysValFromString(status))
 		i++
 
 	}
 	if err := rows.Err(); err != nil {
 		logger.Log("err", err)
+		return err
+	}
+
+	return nil
+
+}
+
+// Function to predict for a single docking station
+func predict(scheme string, dockid string, targetTime time.Time) (PredictionResponse, error) {
+
+	logger.Log("msg", "predicting", "scheme", scheme, "dockid", dockid, "time", targetTime)
+
+	var ret PredictionResponse
+
+	rowCount := db.QueryRow("Select count(*) c from bike_predictor.statuses where SchemeID = ? and DockId = ?", scheme, dockid)
+	var count int
+	if err := rowCount.Scan(&count); err != nil {
+		logger.Log("err", err)
 		return ret, err
 	}
 
-	fmt.Println("%v", trainData)
+	trainData, trainSpecs := createNewDenseInstances(count)
+
+	rows, err := db.Query("Select Bikes, Docks, cMonth, cDay, cMinuteOfDay from bike_predictor.statuses where SchemeID = ? and DockId = ?", scheme, dockid)
+	if err != nil {
+		logger.Log("err", err)
+		return ret, err
+	}
+	defer rows.Close()
+
+	err = addDBRowsToInstance(rows, trainData, trainSpecs)
+	if err != nil {
+		logger.Log("err", err)
+		return ret, err
+	}
 
 	// Now let's create the final instances set
-	targetInst := base.NewDenseInstances()
-	targetInst.AddClassAttribute(attrs[3])
-
-	// Add the attributes
-	targetSpecs := make([]base.AttributeSpec, len(attrs))
-	for i, a := range attrs {
-		targetSpecs[i] = targetInst.AddAttribute(a)
-	}
-	// By convention
-	targetInst.AddClassAttribute(attrs[len(attrs)-1])
+	targetInst, targetSpecs := createNewDenseInstances(1)
 
 	// Allocate space
 	targetInst.Extend(1)
@@ -274,6 +288,11 @@ func predict(scheme string, dockid string, targetTime time.Time) (PredictionResp
 	targetInst.Set(targetSpecs[2], 0, targetSpecs[2].GetAttribute().GetSysValFromString(strconv.Itoa(targetTime.Minute()+(targetTime.Hour()*60))))
 	targetInst.Set(targetSpecs[3], 0, targetSpecs[3].GetAttribute().GetSysValFromString(""))
 
+	return predictAndFit(trainData, targetInst)
+}
+
+func predictAndFit(trainData *base.DenseInstances, targetData *base.DenseInstances) (ret PredictionResponse, err error) {
+
 	//Initialises a new KNN classifier
 	cls := knn.NewKnnClassifier("euclidean", 2)
 
@@ -281,14 +300,14 @@ func predict(scheme string, dockid string, targetTime time.Time) (PredictionResp
 	cls.Fit(trainData)
 
 	//Calculate the Euclidean distance and predict the likely label
-	prediction, err := cls.Predict(targetInst)
+	prediction, err := cls.Predict(targetData)
 	if err != nil {
 		logger.Log("err", err)
 		return ret, err
 	}
 
 	// Prints precision/recall metrics
-	CM, _ := evaluation.GetConfusionMatrix(targetInst, prediction)
+	CM, _ := evaluation.GetConfusionMatrix(targetData, prediction)
 	if err != nil {
 		logger.Log("err", err)
 		return ret, err
